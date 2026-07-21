@@ -6,12 +6,88 @@
 #include "wlr-surface-pointer-interaction.hpp"
 #include "wlr-surface-touch-interaction.cpp"
 #include "wayfire/output-layout.hpp"
+#include "wayfire/core.hpp"
+#include "wayfire/opengl.hpp"
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <wayfire/signal-provider.hpp>
 #include <wlr/util/box.h>
+
+/*
+ * Wait (GPU-side) for all pending writes to a client dmabuf before compositing it.
+ *
+ * Clients like Chromium submit dmabufs whose GPU rendering may still be executing
+ * at commit time; the write-completion fence lives in the dmabuf's kernel
+ * reservation object (either placed there implicitly by the client's driver, or
+ * explicitly via DMA_BUF_IOCTL_IMPORT_SYNC_FILE, which is what Chromium does when
+ * the compositor does not advertise linux-drm-syncobj-v1).
+ *
+ * This mirrors what the wlroots Vulkan renderer does in
+ * vulkan_sync_foreign_texture_acquire(): export the reservation fences as a
+ * sync_file and insert a server-side EGL wait, so all subsequently submitted GPU
+ * work (including compositing this buffer) waits for the client's rendering.
+ */
+static void gles_wait_client_buffer_ready(wlr_buffer *buffer)
+{
+    static const bool disabled = getenv("WAYFIRE_NO_CLIENT_ACQUIRE_WAIT") != nullptr;
+    if (disabled || !wf::get_core().is_gles2())
+    {
+        return;
+    }
+    wlr_dmabuf_attributes dmabuf;
+    if (!wlr_buffer_get_dmabuf(buffer, &dmabuf))
+    {
+        // Not a dmabuf (e.g. shm) => contents are CPU-visible, nothing to wait for.
+        return;
+    }
+    static PFNEGLCREATESYNCKHRPROC create_sync =
+        (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+    static PFNEGLDESTROYSYNCKHRPROC destroy_sync =
+        (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+    static PFNEGLWAITSYNCKHRPROC wait_sync =
+        (PFNEGLWAITSYNCKHRPROC)eglGetProcAddress("eglWaitSyncKHR");
+    if (!create_sync || !destroy_sync || !wait_sync)
+    {
+        return;
+    }
+    for (int i = 0; i < dmabuf.n_planes; i++)
+    {
+        struct dma_buf_export_sync_file req;
+        req.flags = DMA_BUF_SYNC_READ;
+        req.fd    = -1;
+        if (ioctl(dmabuf.fd[i], DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req) < 0)
+        {
+            continue;
+        }
+        bool fd_adopted = false;
+        wf::gles::run_in_context_if_gles([&]
+        {
+            EGLDisplay dpy = eglGetCurrentDisplay();
+            const EGLint attribs[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, req.fd, EGL_NONE};
+            EGLSyncKHR sync = create_sync(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+            if (sync == EGL_NO_SYNC_KHR)
+            {
+                return;
+            }
+            // On success, EGL takes ownership of the fd.
+            fd_adopted = true;
+            wait_sync(dpy, sync, 0);
+            destroy_sync(dpy, sync);
+        });
+        if (!fd_adopted)
+        {
+            close(req.fd);
+        }
+    }
+}
+
 
 wf::scene::surface_state_t::surface_state_t(surface_state_t&& other)
 {
@@ -63,6 +139,7 @@ void wf::scene::surface_state_t::merge_state(wlr_surface *surface)
 
     if (surface->buffer)
     {
+        gles_wait_client_buffer_ready(&surface->buffer->base);
         this->current_buffer = &surface->buffer->base;
         this->texture = surface->buffer->texture;
         this->size    = {surface->current.width, surface->current.height};
